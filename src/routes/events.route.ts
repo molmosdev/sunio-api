@@ -242,11 +242,11 @@ app.post("/:eventId/expenses", async (c: Context) => {
 app.put("/:eventId/expenses/:expenseId", async (c: Context) => {
   const supabase = c.get("supabase");
   const { eventId, expenseId } = c.req.param();
-  const { amount, consumers, description } = await c.req.json();
+  const { payer_id, amount, consumers, description } = await c.req.json();
 
   const { data, error } = await supabase
     .from("expenses")
-    .update({ amount, consumers, description })
+    .update({ payer_id, amount, consumers, description })
     .eq("id", expenseId)
     .eq("event_id", eventId)
     .select("*")

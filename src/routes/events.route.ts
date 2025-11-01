@@ -1,5 +1,6 @@
 import { Context, Hono } from "hono";
 import { customAlphabet } from "nanoid";
+import { getCookie, setCookie } from "hono/cookie";
 
 const nanoid = customAlphabet(
   "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
@@ -43,12 +44,43 @@ export interface Settlement {
   amount: number;
 }
 
+app.get("/recent", (c: Context) => {
+  const cookieName = "recent_events";
+  let recentEvents: { id: string; last_active: string }[] = [];
+  const cookie = getCookie(c, cookieName);
+  if (cookie) {
+    try {
+      recentEvents = JSON.parse(cookie);
+    } catch {}
+  }
+  return c.json({ recentEvents });
+});
+
+app.delete("/recent/:eventId", (c: Context) => {
+  const { eventId } = c.req.param();
+  const cookieName = "recent_events";
+  const maxAge = 60 * 60 * 24 * 90;
+  let recentEvents: { id: string; last_active: string }[] = [];
+  const cookie = getCookie(c, cookieName);
+  if (cookie) {
+    try {
+      recentEvents = JSON.parse(cookie);
+    } catch {}
+  }
+  recentEvents = recentEvents.filter((e) => e.id !== eventId);
+  setCookie(c, cookieName, JSON.stringify(recentEvents), {
+    maxAge,
+    path: "/",
+    httpOnly: false,
+  });
+  return c.json({ recentEvents });
+});
+
 app.post("/", async (c: Context) => {
   const supabase = c.get("supabase");
 
   const { name, participants } = await c.req.json();
 
-  // Generar ID corto para el evento
   const eventId = nanoid();
 
   const { data: event, error: eventError } = await supabase
@@ -86,6 +118,24 @@ app.get("/:eventId", async (c: Context) => {
     .single();
 
   if (error) return c.json({ error: error.message }, 404);
+
+  const cookieName = "recent_events";
+  const maxAge = 60 * 60 * 24 * 90;
+  let recentEvents: { id: string; last_active: string }[] = [];
+  const cookie = getCookie(c, cookieName);
+  if (cookie) {
+    try {
+      recentEvents = JSON.parse(cookie);
+    } catch {}
+  }
+  recentEvents = recentEvents.filter((e) => e.id !== eventId);
+  recentEvents.unshift({ id: eventId, last_active: new Date().toISOString() });
+  if (recentEvents.length > 20) recentEvents = recentEvents.slice(0, 20);
+  setCookie(c, cookieName, JSON.stringify(recentEvents), {
+    maxAge,
+    path: "/",
+    httpOnly: false,
+  });
 
   return c.json(event as Event);
 });

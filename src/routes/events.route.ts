@@ -101,36 +101,16 @@ app.delete("/recent/:eventId", (c: Context) => {
 });
 
 app.get("/recent", async (c: Context) => {
-  const supabase = c.get("supabase");
   const cookieName = "recent_events";
-  let recentEvents: { id: string; last_active: string }[] = [];
+  let recentEvents: { id: string; last_active: string; name: string | null }[] =
+    [];
   const cookie = getCookie(c, cookieName);
   if (cookie) {
     try {
       recentEvents = JSON.parse(cookie);
     } catch {}
   }
-  if (recentEvents.length === 0) return c.json({ recentEvents: [] });
-
-  // Obtener los nombres de los eventos desde la base de datos
-  const ids = recentEvents.map((e) => e.id);
-  const { data: eventsData, error } = await supabase
-    .from("events")
-    .select("id, name");
-  if (error) return c.json({ error: error.message }, 500);
-
-  // Mapear los nombres a los recientes con tipado
-  type EventRow = { id: string; name: string };
-  const eventsMap: Record<string, string> = {};
-  (eventsData as EventRow[]).forEach((e) => {
-    eventsMap[e.id] = e.name;
-  });
-  const recentWithNames = recentEvents.map((e) => ({
-    id: e.id,
-    last_active: e.last_active,
-    name: eventsMap[e.id] || null,
-  }));
-  return c.json({ recentEvents: recentWithNames });
+  return c.json({ recentEvents });
 });
 
 app.get("/:eventId", async (c: Context) => {
@@ -147,7 +127,8 @@ app.get("/:eventId", async (c: Context) => {
 
   const cookieName = "recent_events";
   const maxAge = 60 * 60 * 24 * 90;
-  let recentEvents: { id: string; last_active: string }[] = [];
+  let recentEvents: { id: string; last_active: string; name: string | null }[] =
+    [];
   const cookie = getCookie(c, cookieName);
   if (cookie) {
     try {
@@ -155,7 +136,11 @@ app.get("/:eventId", async (c: Context) => {
     } catch {}
   }
   recentEvents = recentEvents.filter((e) => e.id !== eventId);
-  recentEvents.unshift({ id: eventId, last_active: new Date().toISOString() });
+  recentEvents.unshift({
+    id: eventId,
+    last_active: new Date().toISOString(),
+    name: event.name || null,
+  });
   if (recentEvents.length > 20) recentEvents = recentEvents.slice(0, 20);
 
   const domain = c.req.header("host")?.split(":")[0];
@@ -167,8 +152,6 @@ app.get("/:eventId", async (c: Context) => {
     sameSite: "Lax",
     secure: isLocal ? false : true,
   });
-
-  console.log(getCookie(c, cookieName));
 
   return c.json(event as Event);
 });

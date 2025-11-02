@@ -42,7 +42,48 @@ export interface Settlement {
   from: string;
   to: string;
   amount: number;
+  payment_id?: string;
 }
+
+export interface Payment {
+  id: string;
+  event_id: string;
+  from_participant: string;
+  to_participant: string;
+  amount: number;
+  created_at: string;
+}
+
+app.post("/", async (c: Context) => {
+  const supabase = c.get("supabase");
+
+  const { name, participants } = await c.req.json();
+
+  const eventId = nanoid();
+
+  const { data: event, error: eventError } = await supabase
+    .from("events")
+    .insert({ id: eventId, name })
+    .select("*")
+    .single();
+
+  if (eventError) return c.json({ error: eventError.message }, 500);
+
+  if (participants?.length) {
+    const participantsData = participants.map((p: string) => ({
+      event_id: event.id,
+      name: p,
+    }));
+    const { error: participantsError } = await supabase
+      .from("participants")
+      .insert(participantsData);
+
+    if (participantsError)
+      return c.json({ error: participantsError.message }, 500);
+  }
+
+  return c.json({ eventId: event.id });
+});
 
 app.get("/recent", async (c: Context) => {
   const supabase = c.get("supabase");
@@ -341,49 +382,100 @@ app.get("/:eventId/balances", async (c: Context) => {
   const supabase = c.get("supabase");
   const { eventId } = c.req.param();
 
-  const { data: expenses } = await supabase
-    .from("expenses")
-    .select("*")
-    .eq("event_id", eventId);
-
-  const { data: participants } = await supabase
-    .from("participants")
-    .select("*")
-    .eq("event_id", eventId);
+  const [{ data: expenses }, { data: participants }, { data: payments }] =
+    await Promise.all([
+      supabase.from("expenses").select("*").eq("event_id", eventId),
+      supabase.from("participants").select("*").eq("event_id", eventId),
+      supabase.from("payments").select("*").eq("event_id", eventId),
+    ]);
 
   const balances: Record<string, number> = {};
   participants?.forEach((p: Participant) => (balances[p.id] = 0));
 
+  // 1. Aplica los gastos
   expenses?.forEach((e: Expense) => {
     const split = e.amount / e.consumers.length;
     e.consumers.forEach((cId: string) => {
       balances[cId] -= split;
     });
     balances[e.payer_id] += e.amount;
+  });
+
+  // 2. Aplica los pagos
+  payments?.forEach((p: Payment) => {
+    balances[p.from_participant] += Number(p.amount);
+    balances[p.to_participant] -= Number(p.amount);
   });
 
   return c.json({ balances });
 });
 
-app.post("/:eventId/settle", async (c: Context) => {
+app.post("/:eventId/payments", async (c: Context) => {
+  const supabase = c.get("supabase");
+  const { eventId } = c.req.param();
+  const { from_participant, to_participant, amount } = await c.req.json();
+
+  if (!from_participant || !to_participant || !amount) {
+    return c.json({ error: "Faltan datos obligatorios" }, 400);
+  }
+
+  const { data, error } = await supabase
+    .from("payments")
+    .insert({ event_id: eventId, from_participant, to_participant, amount })
+    .select("*")
+    .single();
+
+  if (error) return c.json({ error: error.message }, 500);
+  return c.json(data as Payment);
+});
+
+app.get("/:eventId/payments", async (c: Context) => {
   const supabase = c.get("supabase");
   const { eventId } = c.req.param();
 
-  const { data: expenses, error: expensesError } = await supabase
-    .from("expenses")
+  const { data, error } = await supabase
+    .from("payments")
     .select("*")
     .eq("event_id", eventId);
+
+  if (error) return c.json({ error: error.message }, 500);
+  return c.json(data as Payment[]);
+});
+
+app.delete("/:eventId/payments/:paymentId", async (c: Context) => {
+  const supabase = c.get("supabase");
+  const { eventId, paymentId } = c.req.param();
+
+  const { error } = await supabase
+    .from("payments")
+    .delete()
+    .eq("id", paymentId)
+    .eq("event_id", eventId);
+
+  if (error) return c.json({ error: error.message }, 500);
+  return c.json({ success: true });
+});
+
+app.get("/:eventId/settlements", async (c: Context) => {
+  const supabase = c.get("supabase");
+  const { eventId } = c.req.param();
+
+  const [
+    { data: expenses, error: expensesError },
+    { data: participants, error: participantsError },
+    { data: payments, error: paymentsError },
+  ] = await Promise.all([
+    supabase.from("expenses").select("*").eq("event_id", eventId),
+    supabase.from("participants").select("*").eq("event_id", eventId),
+    supabase.from("payments").select("*").eq("event_id", eventId),
+  ]);
 
   if (expensesError) return c.json({ error: expensesError.message }, 500);
-
-  const { data: participants, error: participantsError } = await supabase
-    .from("participants")
-    .select("*")
-    .eq("event_id", eventId);
-
   if (participantsError)
     return c.json({ error: participantsError.message }, 500);
+  if (paymentsError) return c.json({ error: paymentsError.message }, 500);
 
+  // 1. Calcula balances SOLO con los gastos
   const balances: Record<string, number> = {};
   participants?.forEach((p: Participant) => (balances[p.id] = 0));
 
@@ -395,6 +487,7 @@ app.post("/:eventId/settle", async (c: Context) => {
     balances[e.payer_id] += e.amount;
   });
 
+  // 2. Calcula settlements ORIGINALES (sin pagos)
   const settlements: Settlement[] = [];
   const positive = Object.entries(balances).filter(([_, v]) => v > 0);
   const negative = Object.entries(balances).filter(([_, v]) => v < 0);
@@ -405,10 +498,20 @@ app.post("/:eventId/settle", async (c: Context) => {
     const [posId, posAmount] = positive[i];
     const [negId, negAmount] = negative[j];
     const amt = Math.min(posAmount, -negAmount);
+
+    // 3. Busca si hay un payment exacto para este settlement
+    const payment = payments?.find(
+      (p: Payment) =>
+        p.from_participant === negId &&
+        p.to_participant === posId &&
+        Math.abs(Number(p.amount) - amt) < 0.01
+    );
+
     settlements.push({
       from: negId,
       to: posId,
       amount: Math.round(amt * 100) / 100,
+      payment_id: payment?.id,
     });
 
     positive[i][1] -= amt;
@@ -418,7 +521,7 @@ app.post("/:eventId/settle", async (c: Context) => {
     if (Math.abs(negative[j][1]) < 0.01) j++;
   }
 
-  return c.json({ balances, settlements });
+  return c.json({ settlements });
 });
 
 app.delete("/cleanup", async (c: Context) => {

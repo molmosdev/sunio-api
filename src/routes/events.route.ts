@@ -368,6 +368,16 @@ app.delete("/:eventId/expenses/:expenseId", async (c: Context) => {
   const supabase = c.get("supabase");
   const { eventId, expenseId } = c.req.param();
 
+  // Primero borra los payments asociados a este expense
+  const { error: paymentsError } = await supabase
+    .from("payments")
+    .delete()
+    .eq("expense_id", expenseId)
+    .eq("event_id", eventId);
+
+  if (paymentsError) return c.json({ error: paymentsError.message }, 500);
+
+  // Luego borra el expense
   const { error } = await supabase
     .from("expenses")
     .delete()
@@ -392,11 +402,11 @@ app.get("/:eventId/balances", async (c: Context) => {
   const balances: Record<string, number> = {};
   participants?.forEach((p: Participant) => (balances[p.id] = 0));
 
-  // 1. Aplica los gastos
+  // 1. Aplica los gastos con reparto preciso
   expenses?.forEach((e: Expense) => {
-    const split = e.amount / e.consumers.length;
-    e.consumers.forEach((cId: string) => {
-      balances[cId] -= split;
+    const splits = splitAmountPrecisely(e.amount, e.consumers.length);
+    e.consumers.forEach((cId: string, idx: number) => {
+      balances[cId] -= splits[idx];
     });
     balances[e.payer_id] += e.amount;
   });
@@ -475,14 +485,14 @@ app.get("/:eventId/settlements", async (c: Context) => {
     return c.json({ error: participantsError.message }, 500);
   if (paymentsError) return c.json({ error: paymentsError.message }, 500);
 
-  // 1. Calcula balances SOLO con los gastos
+  // 1. Calcula balances SOLO con los gastos (con ajuste de redondeo)
   const balances: Record<string, number> = {};
   participants?.forEach((p: Participant) => (balances[p.id] = 0));
 
   expenses?.forEach((e: Expense) => {
-    const split = e.amount / e.consumers.length;
-    e.consumers.forEach((cId: string) => {
-      balances[cId] -= split;
+    const splits = splitAmountPrecisely(e.amount, e.consumers.length);
+    e.consumers.forEach((cId: string, idx: number) => {
+      balances[cId] -= splits[idx];
     });
     balances[e.payer_id] += e.amount;
   });
@@ -566,5 +576,18 @@ app.delete("/cleanup", async (c: Context) => {
   if (error) return c.json({ error: error.message }, 500);
   return c.json({ success: true });
 });
+
+function splitAmountPrecisely(total: number, n: number): number[] {
+  const exact = total / n;
+  const floored = Math.floor(exact * 100) / 100;
+  const result = Array(n).fill(floored);
+  let sum = floored * n;
+  let diff = Math.round((total - sum) * 100);
+
+  for (let i = 0; diff > 0; i++, diff--) {
+    result[i] = Math.round((result[i] + 0.01) * 100) / 100;
+  }
+  return result;
+}
 
 export default app;

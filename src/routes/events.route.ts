@@ -488,7 +488,8 @@ app.get("/:eventId/settlements", async (c: Context) => {
   });
 
   // 2. Calcula settlements ORIGINALES (sin pagos)
-  const settlements: Settlement[] = [];
+  const originalSettlements: { from: string; to: string; amount: number }[] =
+    [];
   const positive = Object.entries(balances).filter(([_, v]) => v > 0);
   const negative = Object.entries(balances).filter(([_, v]) => v < 0);
 
@@ -499,19 +500,10 @@ app.get("/:eventId/settlements", async (c: Context) => {
     const [negId, negAmount] = negative[j];
     const amt = Math.min(posAmount, -negAmount);
 
-    // 3. Busca si hay un payment exacto para este settlement
-    const payment = payments?.find(
-      (p: Payment) =>
-        p.from_participant === negId &&
-        p.to_participant === posId &&
-        Math.abs(Number(p.amount) - amt) < 0.01
-    );
-
-    settlements.push({
+    originalSettlements.push({
       from: negId,
       to: posId,
       amount: Math.round(amt * 100) / 100,
-      payment_id: payment?.id,
     });
 
     positive[i][1] -= amt;
@@ -519,6 +511,43 @@ app.get("/:eventId/settlements", async (c: Context) => {
 
     if (Math.abs(positive[i][1]) < 0.01) i++;
     if (Math.abs(negative[j][1]) < 0.01) j++;
+  }
+
+  // 3. Para cada settlement original, busca pagos asociados y separa pagos exactos y pendientes
+  const settlements: Settlement[] = [];
+
+  for (const s of originalSettlements) {
+    // Busca todos los pagos entre from y to
+    const relatedPayments =
+      payments?.filter(
+        (p: Payment) =>
+          p.from_participant === s.from && p.to_participant === s.to
+      ) || [];
+
+    let remaining = s.amount;
+
+    // Para cada pago, crea un settlement pagado
+    for (const p of relatedPayments) {
+      const paidAmount = Math.min(remaining, Number(p.amount));
+      if (paidAmount > 0) {
+        settlements.push({
+          from: s.from,
+          to: s.to,
+          amount: Math.round(paidAmount * 100) / 100,
+          payment_id: p.id,
+        });
+        remaining -= paidAmount;
+      }
+    }
+
+    // Si queda algo pendiente, crea un settlement sin payment_id
+    if (remaining > 0.01) {
+      settlements.push({
+        from: s.from,
+        to: s.to,
+        amount: Math.round(remaining * 100) / 100,
+      });
+    }
   }
 
   return c.json({ settlements });

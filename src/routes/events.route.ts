@@ -475,7 +475,19 @@ app.get("/:eventId/settlements", async (c: Context) => {
     return c.json({ error: participantsError.message }, 500);
   if (paymentsError) return c.json({ error: paymentsError.message }, 500);
 
-  // 1. Calcula balances SOLO con los gastos (con ajuste de redondeo)
+  const settlements: Settlement[] = [];
+
+  // 1. Añade todos los pagos como settlements históricos
+  payments?.forEach((p: Payment) => {
+    settlements.push({
+      from: p.from_participant,
+      to: p.to_participant,
+      amount: Number(p.amount),
+      payment_id: p.id,
+    });
+  });
+
+  // 2. Calcula balances SOLO con los gastos (con ajuste de redondeo)
   const balances: Record<string, number> = {};
   participants?.forEach((p: Participant) => (balances[p.id] = 0));
 
@@ -487,7 +499,7 @@ app.get("/:eventId/settlements", async (c: Context) => {
     balances[e.payer_id] += e.amount;
   });
 
-  // 2. Calcula settlements ORIGINALES (sin pagos)
+  // 3. Calcula settlements ORIGINALES (sin pagos)
   const originalSettlements: { from: string; to: string; amount: number }[] =
     [];
   const positive = Object.entries(balances).filter(([_, v]) => v > 0);
@@ -513,34 +525,32 @@ app.get("/:eventId/settlements", async (c: Context) => {
     if (Math.abs(negative[j][1]) < 0.01) j++;
   }
 
-  // 3. Para cada settlement original, busca pagos asociados y separa pagos exactos y pendientes
-  const settlements: Settlement[] = [];
-
+  // 4. Para cada settlement original, descuenta todos los pagos (en cualquier sentido) y solo añade settlement pendiente si queda saldo positivo
   for (const s of originalSettlements) {
-    // Busca todos los pagos entre from y to
-    const relatedPayments =
+    // Suma todos los pagos de from->to
+    const pagosDirectos =
       payments?.filter(
         (p: Payment) =>
           p.from_participant === s.from && p.to_participant === s.to
       ) || [];
+    // Suma todos los pagos de to->from (pagos cruzados)
+    const pagosCruzados =
+      payments?.filter(
+        (p: Payment) =>
+          p.from_participant === s.to && p.to_participant === s.from
+      ) || [];
 
-    let remaining = s.amount;
+    let totalPagado = 0;
+    pagosDirectos.forEach((p: Payment) => {
+      totalPagado += Number(p.amount);
+    });
+    pagosCruzados.forEach((p: Payment) => {
+      totalPagado -= Number(p.amount);
+    });
 
-    // Para cada pago, crea un settlement pagado
-    for (const p of relatedPayments) {
-      const paidAmount = Math.min(remaining, Number(p.amount));
-      if (paidAmount > 0) {
-        settlements.push({
-          from: s.from,
-          to: s.to,
-          amount: Math.round(paidAmount * 100) / 100,
-          payment_id: p.id,
-        });
-        remaining -= paidAmount;
-      }
-    }
+    let remaining = s.amount - totalPagado;
 
-    // Si queda algo pendiente, crea un settlement sin payment_id
+    // Solo añade settlement pendiente si el remaining es mayor que 0.01
     if (remaining > 0.01) {
       settlements.push({
         from: s.from,
@@ -548,9 +558,10 @@ app.get("/:eventId/settlements", async (c: Context) => {
         amount: Math.round(remaining * 100) / 100,
       });
     }
+    // Si remaining <= 0, no añadas nada (ya está cubierto o pagado de más)
   }
 
-  // 4. Detecta pagos en exceso y genera liquidaciones inversas SOLO si hay pagos
+  // 5. Detecta pagos en exceso y genera liquidaciones inversas SOLO si hay pagos
   if (payments && payments.length > 0) {
     // Calcula balances finales tras gastos y pagos
     const finalBalances: Record<string, number> = {};

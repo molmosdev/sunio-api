@@ -368,16 +368,6 @@ app.delete("/:eventId/expenses/:expenseId", async (c: Context) => {
   const supabase = c.get("supabase");
   const { eventId, expenseId } = c.req.param();
 
-  // Primero borra los payments asociados a este expense
-  const { error: paymentsError } = await supabase
-    .from("payments")
-    .delete()
-    .eq("expense_id", expenseId)
-    .eq("event_id", eventId);
-
-  if (paymentsError) return c.json({ error: paymentsError.message }, 500);
-
-  // Luego borra el expense
   const { error } = await supabase
     .from("expenses")
     .delete()

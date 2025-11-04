@@ -550,47 +550,61 @@ app.get("/:eventId/settlements", async (c: Context) => {
     }
   }
 
-  // 4. Detecta pagos en exceso y genera liquidaciones inversas
-  // Calcula balances finales tras gastos y pagos
-  const finalBalances: Record<string, number> = {};
-  participants?.forEach((p: Participant) => (finalBalances[p.id] = 0));
-  // Aplica gastos
-  expenses?.forEach((e: Expense) => {
-    const splits = splitAmountPrecisely(e.amount, e.consumers.length);
-    e.consumers.forEach((cId: string, idx: number) => {
-      finalBalances[cId] -= splits[idx];
-    });
-    finalBalances[e.payer_id] += e.amount;
-  });
-  // Aplica pagos
-  payments?.forEach((p: Payment) => {
-    finalBalances[p.from_participant] += Number(p.amount);
-    finalBalances[p.to_participant] -= Number(p.amount);
-  });
-
-  // Busca participantes con saldo positivo (pagaron de más)
-  const overpayers = Object.entries(finalBalances).filter(([_, v]) => v > 0.01);
-  const underpayers = Object.entries(finalBalances).filter(
-    ([_, v]) => v < -0.01
-  );
-
-  let oi = 0,
-    uj = 0;
-  while (oi < overpayers.length && uj < underpayers.length) {
-    const [overId, overAmt] = overpayers[oi];
-    const [underId, underAmt] = underpayers[uj];
-    const amt = Math.min(overAmt, -underAmt);
-    if (amt > 0.01) {
-      settlements.push({
-        from: underId,
-        to: overId,
-        amount: Math.round(amt * 100) / 100,
+  // 4. Detecta pagos en exceso y genera liquidaciones inversas SOLO si hay pagos
+  if (payments && payments.length > 0) {
+    // Calcula balances finales tras gastos y pagos
+    const finalBalances: Record<string, number> = {};
+    participants?.forEach((p: Participant) => (finalBalances[p.id] = 0));
+    // Aplica gastos
+    expenses?.forEach((e: Expense) => {
+      const splits = splitAmountPrecisely(e.amount, e.consumers.length);
+      e.consumers.forEach((cId: string, idx: number) => {
+        finalBalances[cId] -= splits[idx];
       });
-      overpayers[oi][1] -= amt;
-      underpayers[uj][1] += amt;
+      finalBalances[e.payer_id] += e.amount;
+    });
+    // Aplica pagos
+    payments?.forEach((p: Payment) => {
+      finalBalances[p.from_participant] += Number(p.amount);
+      finalBalances[p.to_participant] -= Number(p.amount);
+    });
+
+    // Busca participantes con saldo positivo (pagaron de más)
+    const overpayers = Object.entries(finalBalances).filter(
+      ([_, v]) => v > 0.01
+    );
+    const underpayers = Object.entries(finalBalances).filter(
+      ([_, v]) => v < -0.01
+    );
+
+    let oi = 0,
+      uj = 0;
+    while (oi < overpayers.length && uj < underpayers.length) {
+      const [overId, overAmt] = overpayers[oi];
+      const [underId, underAmt] = underpayers[uj];
+      const amt = Math.min(overAmt, -underAmt);
+      if (amt > 0.01) {
+        // Evita duplicados: solo añade si no existe ya un settlement pendiente igual
+        const alreadyExists = settlements.some(
+          (s) =>
+            s.from === underId &&
+            s.to === overId &&
+            Math.abs(s.amount - Math.round(amt * 100) / 100) < 0.01 &&
+            !s.payment_id
+        );
+        if (!alreadyExists) {
+          settlements.push({
+            from: underId,
+            to: overId,
+            amount: Math.round(amt * 100) / 100,
+          });
+        }
+        overpayers[oi][1] -= amt;
+        underpayers[uj][1] += amt;
+      }
+      if (Math.abs(overpayers[oi][1]) < 0.01) oi++;
+      if (Math.abs(underpayers[uj][1]) < 0.01) uj++;
     }
-    if (Math.abs(overpayers[oi][1]) < 0.01) oi++;
-    if (Math.abs(underpayers[uj][1]) < 0.01) uj++;
   }
 
   return c.json({ settlements });

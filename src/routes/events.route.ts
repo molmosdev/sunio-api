@@ -22,6 +22,8 @@ export interface Participant {
   name: string;
   pin?: string | null;
   created_at: string;
+  is_admin?: boolean;
+  pin_reset_requested?: boolean;
 }
 
 export interface Expense {
@@ -32,6 +34,7 @@ export interface Expense {
   consumers: string[];
   description?: string | null;
   created_at: string;
+  updated_by: string;
 }
 
 export interface Balance {
@@ -54,36 +57,7 @@ export interface Payment {
   created_at: string;
 }
 
-app.post("/", async (c: Context) => {
-  const supabase = c.get("supabase");
-
-  const { name, participants } = await c.req.json();
-
-  const eventId = nanoid();
-
-  const { data: event, error: eventError } = await supabase
-    .from("events")
-    .insert({ id: eventId, name })
-    .select("*")
-    .single();
-
-  if (eventError) return c.json({ error: eventError.message }, 500);
-
-  if (participants?.length) {
-    const participantsData = participants.map((p: string) => ({
-      event_id: event.id,
-      name: p,
-    }));
-    const { error: participantsError } = await supabase
-      .from("participants")
-      .insert(participantsData);
-
-    if (participantsError)
-      return c.json({ error: participantsError.message }, 500);
-  }
-
-  return c.json({ eventId: event.id });
-});
+// Events
 
 app.get("/recent", async (c: Context) => {
   const supabase = c.get("supabase");
@@ -97,7 +71,6 @@ app.get("/recent", async (c: Context) => {
   }
   if (recentEvents.length === 0) return c.json({ recentEvents: [] });
 
-  // Obtener los nombres de los eventos desde la base de datos
   const ids = recentEvents.map((e) => e.id);
   const { data: eventsData, error } = await supabase
     .from("events")
@@ -105,7 +78,6 @@ app.get("/recent", async (c: Context) => {
     .in("id", ids);
   if (error) return c.json({ error: error.message }, 500);
 
-  // Mapear los nombres a los recientes
   const eventsMap = Object.fromEntries(
     (eventsData || []).map((e: { id: any; name: any }) => [e.id, e.name])
   );
@@ -141,17 +113,17 @@ app.delete("/recent/:eventId", (c: Context) => {
   return c.json({ recentEvents });
 });
 
-app.get("/recent", async (c: Context) => {
-  const cookieName = "recent_events";
-  let recentEvents: { id: string; last_active: string; name: string | null }[] =
-    [];
-  const cookie = getCookie(c, cookieName);
-  if (cookie) {
-    try {
-      recentEvents = JSON.parse(cookie);
-    } catch {}
-  }
-  return c.json({ recentEvents });
+app.post("/", async (c: Context) => {
+  const supabase = c.get("supabase");
+  const { name } = await c.req.json();
+  const eventId = nanoid();
+  const { data: event, error: eventError } = await supabase
+    .from("events")
+    .insert({ id: eventId, name })
+    .select("*")
+    .single();
+  if (eventError) return c.json({ error: eventError.message }, 500);
+  return c.json({ eventId: event.id });
 });
 
 app.get("/:eventId", async (c: Context) => {
@@ -214,6 +186,22 @@ app.put("/:eventId", async (c: Context) => {
   return c.json(data as Event);
 });
 
+app.delete("/cleanup", async (c: Context) => {
+  const supabase = c.get("supabase");
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - 90);
+
+  const { error } = await supabase
+    .from("events")
+    .delete()
+    .lt("last_active", cutoff.toISOString());
+
+  if (error) return c.json({ error: error.message }, 500);
+  return c.json({ success: true });
+});
+
+// Participants
+
 app.get("/:eventId/participants", async (c: Context) => {
   const supabase = c.get("supabase");
   const { eventId } = c.req.param();
@@ -231,11 +219,34 @@ app.get("/:eventId/participants", async (c: Context) => {
 app.post("/:eventId/participants", async (c: Context) => {
   const supabase = c.get("supabase");
   const { eventId } = c.req.param();
-  const { name } = await c.req.json();
+  const { name, pin } = await c.req.json();
+
+  if (!name || !pin) {
+    return c.json({ error: "El nombre y el PIN son obligatorios" }, 400);
+  }
+
+  const { data: existing, error: existingError } = await supabase
+    .from("participants")
+    .select("id")
+    .eq("event_id", eventId)
+    .eq("name", name);
+  if (existingError) return c.json({ error: existingError.message }, 500);
+  if (existing && existing.length > 0) {
+    return c.json(
+      { error: "Ya existe un participante con ese nombre en el evento" },
+      409
+    );
+  }
+
+  const { count } = await supabase
+    .from("participants")
+    .select("id", { count: "exact", head: true })
+    .eq("event_id", eventId);
+  const isAdmin = count === 0;
 
   const { data, error } = await supabase
     .from("participants")
-    .insert({ event_id: eventId, name })
+    .insert({ event_id: eventId, name, pin, is_admin: isAdmin })
     .select("*")
     .single();
 
@@ -260,6 +271,20 @@ app.put("/:eventId/participants/:participantId", async (c: Context) => {
   if (error) return c.json({ error: error.message }, 500);
 
   return c.json(data as Participant);
+});
+
+app.delete("/:eventId/participants/:participantId", async (c: Context) => {
+  const supabase = c.get("supabase");
+  const { eventId, participantId } = c.req.param();
+
+  const { error } = await supabase
+    .from("participants")
+    .delete()
+    .eq("id", participantId)
+    .eq("event_id", eventId);
+
+  if (error) return c.json({ error: error.message }, 500);
+  return c.json({ success: true });
 });
 
 app.post("/:eventId/participants/:participantId/pin", async (c: Context) => {
@@ -299,22 +324,143 @@ app.post("/:eventId/participants/:participantId/login", async (c: Context) => {
   if (typedParticipant.pin !== pin)
     return c.json({ error: "PIN incorrecto" }, 401);
 
-  return c.json({ success: true, participantId: typedParticipant.id });
+  return c.json({ success: true, participant: typedParticipant });
 });
 
-app.delete("/:eventId/participants/:participantId", async (c: Context) => {
+app.post(
+  "/:eventId/participants/:participantId/request-pin-reset",
+  async (c: Context) => {
+    const supabase = c.get("supabase");
+    const { eventId, participantId } = c.req.param();
+
+    const { data, error } = await supabase
+      .from("participants")
+      .update({ pin_reset_requested: true })
+      .eq("id", participantId)
+      .eq("event_id", eventId)
+      .select("*")
+      .single();
+    if (error) return c.json({ error: error.message }, 500);
+    return c.json(data as Participant);
+  }
+);
+
+app.post(
+  "/:eventId/participants/:participantId/reset-pin",
+  async (c: Context) => {
+    const supabase = c.get("supabase");
+    const { eventId, participantId } = c.req.param();
+    const { requesterId } = await c.req.json();
+
+    const { data: requester, error: requesterError } = await supabase
+      .from("participants")
+      .select("is_admin")
+      .eq("id", requesterId)
+      .eq("event_id", eventId)
+      .single();
+    if (requesterError || !requester?.is_admin) {
+      return c.json({ error: "Solo un admin puede resetear el PIN" }, 403);
+    }
+
+    const { data, error } = await supabase
+      .from("participants")
+      .update({ pin: null, pin_reset_requested: false })
+      .eq("id", participantId)
+      .eq("event_id", eventId)
+      .select("*")
+      .single();
+    if (error) return c.json({ error: error.message }, 500);
+    return c.json(data as Participant);
+  }
+);
+
+app.post(
+  "/:eventId/participants/:participantId/promote",
+  async (c: Context) => {
+    const supabase = c.get("supabase");
+    const { eventId, participantId } = c.req.param();
+    const { requesterId } = await c.req.json();
+
+    const { data: requester, error: requesterError } = await supabase
+      .from("participants")
+      .select("is_admin")
+      .eq("id", requesterId)
+      .eq("event_id", eventId)
+      .single();
+    if (requesterError || !requester?.is_admin) {
+      return c.json(
+        { error: "Solo un admin puede promover a otro participante" },
+        403
+      );
+    }
+
+    const { data, error } = await supabase
+      .from("participants")
+      .update({ is_admin: true })
+      .eq("id", participantId)
+      .eq("event_id", eventId)
+      .select("*")
+      .single();
+    if (error) return c.json({ error: error.message }, 500);
+    return c.json(data as Participant);
+  }
+);
+
+app.post("/:eventId/participants/:participantId/demote", async (c: Context) => {
   const supabase = c.get("supabase");
   const { eventId, participantId } = c.req.param();
+  const { requesterId } = await c.req.json();
 
-  const { error } = await supabase
+  const { data: requester, error: requesterError } = await supabase
     .from("participants")
-    .delete()
+    .select("is_admin")
+    .eq("id", requesterId)
+    .eq("event_id", eventId)
+    .single();
+  if (requesterError || !requester?.is_admin) {
+    return c.json({ error: "Solo un admin puede quitar el rol de admin" }, 403);
+  }
+
+  if (requesterId === participantId) {
+    const { count } = await supabase
+      .from("participants")
+      .select("id", { count: "exact", head: true })
+      .eq("event_id", eventId)
+      .eq("is_admin", true);
+    if (count === 1) {
+      return c.json(
+        { error: "No puedes quitarte el rol de admin si eres el único admin" },
+        400
+      );
+    }
+  }
+
+  const { data, error } = await supabase
+    .from("participants")
+    .update({ is_admin: false })
     .eq("id", participantId)
-    .eq("event_id", eventId);
+    .eq("event_id", eventId)
+    .select("*")
+    .single();
+  if (error) return c.json({ error: error.message }, 500);
+  return c.json(data as Participant);
+});
+
+app.get("/:eventId/admins", async (c: Context) => {
+  const supabase = c.get("supabase");
+  const { eventId } = c.req.param();
+
+  const { data, error } = await supabase
+    .from("participants")
+    .select("*")
+    .eq("event_id", eventId)
+    .eq("is_admin", true);
 
   if (error) return c.json({ error: error.message }, 500);
-  return c.json({ success: true });
+  return c.json(data as Participant[]);
 });
+
+// Expenses
 
 app.get("/:eventId/expenses", async (c: Context) => {
   const supabase = c.get("supabase");
@@ -333,11 +479,19 @@ app.get("/:eventId/expenses", async (c: Context) => {
 app.post("/:eventId/expenses", async (c: Context) => {
   const supabase = c.get("supabase");
   const { eventId } = c.req.param();
-  const { payer_id, amount, consumers, description } = await c.req.json();
+  const { payer_id, amount, consumers, description, updated_by } =
+    await c.req.json();
 
   const { data, error } = await supabase
     .from("expenses")
-    .insert({ event_id: eventId, payer_id, amount, consumers, description })
+    .insert({
+      event_id: eventId,
+      payer_id,
+      amount,
+      consumers,
+      description,
+      updated_by,
+    })
     .select("*")
     .single();
 
@@ -349,11 +503,12 @@ app.post("/:eventId/expenses", async (c: Context) => {
 app.put("/:eventId/expenses/:expenseId", async (c: Context) => {
   const supabase = c.get("supabase");
   const { eventId, expenseId } = c.req.param();
-  const { payer_id, amount, consumers, description } = await c.req.json();
+  const { payer_id, amount, consumers, description, updated_by } =
+    await c.req.json();
 
   const { data, error } = await supabase
     .from("expenses")
-    .update({ payer_id, amount, consumers, description })
+    .update({ payer_id, amount, consumers, description, updated_by })
     .eq("id", expenseId)
     .eq("event_id", eventId)
     .select("*")
@@ -377,6 +532,56 @@ app.delete("/:eventId/expenses/:expenseId", async (c: Context) => {
   if (error) return c.json({ error: error.message }, 500);
   return c.json({ success: true });
 });
+
+// Payments
+
+app.get("/:eventId/payments", async (c: Context) => {
+  const supabase = c.get("supabase");
+  const { eventId } = c.req.param();
+
+  const { data, error } = await supabase
+    .from("payments")
+    .select("*")
+    .eq("event_id", eventId);
+
+  if (error) return c.json({ error: error.message }, 500);
+  return c.json(data as Payment[]);
+});
+
+app.post("/:eventId/payments", async (c: Context) => {
+  const supabase = c.get("supabase");
+  const { eventId } = c.req.param();
+  const { from_participant, to_participant, amount } = await c.req.json();
+
+  if (!from_participant || !to_participant || !amount) {
+    return c.json({ error: "Faltan datos obligatorios" }, 400);
+  }
+
+  const { data, error } = await supabase
+    .from("payments")
+    .insert({ event_id: eventId, from_participant, to_participant, amount })
+    .select("*")
+    .single();
+
+  if (error) return c.json({ error: error.message }, 500);
+  return c.json(data as Payment);
+});
+
+app.delete("/:eventId/payments/:paymentId", async (c: Context) => {
+  const supabase = c.get("supabase");
+  const { eventId, paymentId } = c.req.param();
+
+  const { error } = await supabase
+    .from("payments")
+    .delete()
+    .eq("id", paymentId)
+    .eq("event_id", eventId);
+
+  if (error) return c.json({ error: error.message }, 500);
+  return c.json({ success: true });
+});
+
+// Balances
 
 app.get("/:eventId/balances", async (c: Context) => {
   const supabase = c.get("supabase");
@@ -410,51 +615,7 @@ app.get("/:eventId/balances", async (c: Context) => {
   return c.json({ balances });
 });
 
-app.post("/:eventId/payments", async (c: Context) => {
-  const supabase = c.get("supabase");
-  const { eventId } = c.req.param();
-  const { from_participant, to_participant, amount } = await c.req.json();
-
-  if (!from_participant || !to_participant || !amount) {
-    return c.json({ error: "Faltan datos obligatorios" }, 400);
-  }
-
-  const { data, error } = await supabase
-    .from("payments")
-    .insert({ event_id: eventId, from_participant, to_participant, amount })
-    .select("*")
-    .single();
-
-  if (error) return c.json({ error: error.message }, 500);
-  return c.json(data as Payment);
-});
-
-app.get("/:eventId/payments", async (c: Context) => {
-  const supabase = c.get("supabase");
-  const { eventId } = c.req.param();
-
-  const { data, error } = await supabase
-    .from("payments")
-    .select("*")
-    .eq("event_id", eventId);
-
-  if (error) return c.json({ error: error.message }, 500);
-  return c.json(data as Payment[]);
-});
-
-app.delete("/:eventId/payments/:paymentId", async (c: Context) => {
-  const supabase = c.get("supabase");
-  const { eventId, paymentId } = c.req.param();
-
-  const { error } = await supabase
-    .from("payments")
-    .delete()
-    .eq("id", paymentId)
-    .eq("event_id", eventId);
-
-  if (error) return c.json({ error: error.message }, 500);
-  return c.json({ success: true });
-});
+// Settlements
 
 app.get("/:eventId/settlements", async (c: Context) => {
   const supabase = c.get("supabase");
@@ -619,20 +780,6 @@ app.get("/:eventId/settlements", async (c: Context) => {
   }
 
   return c.json({ settlements });
-});
-
-app.delete("/cleanup", async (c: Context) => {
-  const supabase = c.get("supabase");
-  const cutoff = new Date();
-  cutoff.setDate(cutoff.getDate() - 90);
-
-  const { error } = await supabase
-    .from("events")
-    .delete()
-    .lt("last_active", cutoff.toISOString());
-
-  if (error) return c.json({ error: error.message }, 500);
-  return c.json({ success: true });
 });
 
 function splitAmountPrecisely(total: number, n: number): number[] {

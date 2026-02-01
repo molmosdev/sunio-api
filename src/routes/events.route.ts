@@ -648,7 +648,7 @@ app.get("/:eventId/settlements", async (c: Context) => {
     });
   });
 
-  // 2. Calcula balances SOLO con los gastos (con ajuste de redondeo)
+  // 2. Calcula balances FINALES (gastos + pagos)
   const balances: Record<string, number> = {};
   participants?.forEach((p: Participant) => (balances[p.id] = 0));
 
@@ -660,123 +660,37 @@ app.get("/:eventId/settlements", async (c: Context) => {
     balances[e.payer_id] += e.amount;
   });
 
-  // 3. Calcula settlements ORIGINALES (sin pagos)
-  const originalSettlements: { from: string; to: string; amount: number }[] =
-    [];
-  const positive = Object.entries(balances).filter(([_, v]) => v > 0);
-  const negative = Object.entries(balances).filter(([_, v]) => v < 0);
+  payments?.forEach((p: Payment) => {
+    balances[p.from_participant] += Number(p.amount);
+    balances[p.to_participant] -= Number(p.amount);
+  });
+
+  // 3. Calcula liquidaciones PENDIENTES óptimas a partir de los balances finales
+  const positive = Object.entries(balances)
+    .filter(([_, v]) => v > 0.01)
+    .map(([id, amt]) => ({ id, amt }));
+  const negative = Object.entries(balances)
+    .filter(([_, v]) => v < -0.01)
+    .map(([id, amt]) => ({ id, amt: -amt }));
 
   let i = 0,
     j = 0;
   while (i < positive.length && j < negative.length) {
-    const [posId, posAmount] = positive[i];
-    const [negId, negAmount] = negative[j];
-    const amt = Math.min(posAmount, -negAmount);
+    const amt = Math.min(positive[i].amt, negative[j].amt);
 
-    originalSettlements.push({
-      from: negId,
-      to: posId,
-      amount: Math.round(amt * 100) / 100,
-    });
-
-    positive[i][1] -= amt;
-    negative[j][1] += amt;
-
-    if (Math.abs(positive[i][1]) < 0.01) i++;
-    if (Math.abs(negative[j][1]) < 0.01) j++;
-  }
-
-  // 4. Para cada settlement original, descuenta todos los pagos (en cualquier sentido) y solo añade settlement pendiente si queda saldo positivo
-  for (const s of originalSettlements) {
-    // Suma todos los pagos de from->to
-    const pagosDirectos =
-      payments?.filter(
-        (p: Payment) =>
-          p.from_participant === s.from && p.to_participant === s.to
-      ) || [];
-    // Suma todos los pagos de to->from (pagos cruzados)
-    const pagosCruzados =
-      payments?.filter(
-        (p: Payment) =>
-          p.from_participant === s.to && p.to_participant === s.from
-      ) || [];
-
-    let totalPagado = 0;
-    pagosDirectos.forEach((p: Payment) => {
-      totalPagado += Number(p.amount);
-    });
-    pagosCruzados.forEach((p: Payment) => {
-      totalPagado -= Number(p.amount);
-    });
-
-    let remaining = s.amount - totalPagado;
-
-    // Solo añade settlement pendiente si el remaining es mayor que 0.01
-    if (remaining > 0.01) {
+    if (amt > 0.01) {
       settlements.push({
-        from: s.from,
-        to: s.to,
-        amount: Math.round(remaining * 100) / 100,
+        from: negative[j].id,
+        to: positive[i].id,
+        amount: Math.round(amt * 100) / 100,
       });
     }
-    // Si remaining <= 0, no añadas nada (ya está cubierto o pagado de más)
-  }
 
-  // 5. Detecta pagos en exceso y genera liquidaciones inversas SOLO si hay pagos
-  if (payments && payments.length > 0) {
-    // Calcula balances finales tras gastos y pagos
-    const finalBalances: Record<string, number> = {};
-    participants?.forEach((p: Participant) => (finalBalances[p.id] = 0));
-    // Aplica gastos
-    expenses?.forEach((e: Expense) => {
-      const splits = splitAmountPrecisely(e.amount, e.consumers.length);
-      e.consumers.forEach((cId: string, idx: number) => {
-        finalBalances[cId] -= splits[idx];
-      });
-      finalBalances[e.payer_id] += e.amount;
-    });
-    // Aplica pagos
-    payments?.forEach((p: Payment) => {
-      finalBalances[p.from_participant] += Number(p.amount);
-      finalBalances[p.to_participant] -= Number(p.amount);
-    });
+    positive[i].amt -= amt;
+    negative[j].amt -= amt;
 
-    // Busca participantes con saldo positivo (pagaron de más)
-    const overpayers = Object.entries(finalBalances).filter(
-      ([_, v]) => v > 0.01
-    );
-    const underpayers = Object.entries(finalBalances).filter(
-      ([_, v]) => v < -0.01
-    );
-
-    let oi = 0,
-      uj = 0;
-    while (oi < overpayers.length && uj < underpayers.length) {
-      const [overId, overAmt] = overpayers[oi];
-      const [underId, underAmt] = underpayers[uj];
-      const amt = Math.min(overAmt, -underAmt);
-      if (amt > 0.01) {
-        // Evita duplicados: solo añade si no existe ya un settlement pendiente igual
-        const alreadyExists = settlements.some(
-          (s) =>
-            s.from === underId &&
-            s.to === overId &&
-            Math.abs(s.amount - Math.round(amt * 100) / 100) < 0.01 &&
-            !s.payment_id
-        );
-        if (!alreadyExists) {
-          settlements.push({
-            from: underId,
-            to: overId,
-            amount: Math.round(amt * 100) / 100,
-          });
-        }
-        overpayers[oi][1] -= amt;
-        underpayers[uj][1] += amt;
-      }
-      if (Math.abs(overpayers[oi][1]) < 0.01) oi++;
-      if (Math.abs(underpayers[uj][1]) < 0.01) uj++;
-    }
+    if (positive[i].amt < 0.01) i++;
+    if (negative[j].amt < 0.01) j++;
   }
 
   return c.json({ settlements });
